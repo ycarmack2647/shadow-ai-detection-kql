@@ -1,0 +1,173 @@
+// ============================================================
+// DETECTION 05: Scripted or Automated AI API Usage
+// ============================================================
+// DESCRIPTION:
+//   Detects non-browser processes (Python, PowerShell, curl,
+//   Node.js, etc.) making direct connections to AI service APIs.
+//   This pattern indicates automated/scripted AI usage — the
+//   highest risk vector because it's often used to process
+//   large datasets programmatically against AI APIs.
+//
+// MITRE ATT&CK:
+//   T1059 - Command and Scripting Interpreter
+//   T1059.001 - PowerShell
+//   T1059.006 - Python
+//   T1567.002 - Exfiltration Over Web Service
+//
+// DATA SOURCE: Microsoft Defender for Endpoint (MDE)
+//   Tables: DeviceNetworkEvents + DeviceProcessEvents
+//
+// SEVERITY: High → Critical (depending on data volume)
+// FREQUENCY: Run every 30 minutes
+// ============================================================
+
+let LookbackWindow = 24h;
+let HighVolumeThreshold = 50;   // 50+ API calls in window = automated behavior
+
+// --- AI API ENDPOINTS (specifically API subdomain focused) ---
+let AI_API_Domains = dynamic([
+    // Programmatic API endpoints — highest risk
+    "api.openai.com",
+    "api.anthropic.com",
+    "generativelanguage.googleapis.com",  // Google Gemini API
+    "api.cohere.com",
+    "api.mistral.ai",
+    "api-inference.huggingface.co",
+    "api.together.xyz",
+    "api.groq.com",
+    "api.perplexity.ai",
+    "openrouter.ai",
+    // Azure OpenAI (may be sanctioned — review before alerting)
+    // "openai.azure.com",   // Comment out if Azure OpenAI is approved
+    // Replicate API
+    "api.replicate.com"
+]);
+
+// --- SCRIPTING / AUTOMATION PROCESSES ---
+let ScriptingProcesses = dynamic([
+    // Python runtimes
+    "python.exe", "python3.exe", "python3.11.exe", "python3.12.exe",
+    // PowerShell
+    "powershell.exe", "pwsh.exe",
+    // Command line HTTP tools
+    "curl.exe", "wget.exe",
+    // Node.js
+    "node.exe",
+    // Other scripting
+    "cmd.exe", "wscript.exe", "cscript.exe",
+    // Jupyter (often used for data science pipelines)
+    "jupyter.exe", "jupyter-notebook.exe",
+    // R statistical computing
+    "rscript.exe",
+    // Go / compiled tools
+    "go.exe"
+]);
+
+// --- STEP 1: Find scripted AI API connections ---
+let ScriptedAIConnections = DeviceNetworkEvents
+| where Timestamp > ago(LookbackWindow)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (AI_API_Domains)
+    or RemotePort == 443 and RemoteUrl has_any (AI_API_Domains)
+// Filter to non-browser initiating processes
+| where InitiatingProcessFileName in~ (ScriptingProcesses)
+| extend AI_API = tostring(parse_url(RemoteUrl).Host)
+| project
+    Timestamp,
+    DeviceName,
+    DeviceId,
+    User = InitiatingProcessAccountName,
+    Process = InitiatingProcessFileName,
+    AI_API,
+    RemoteUrl,
+    SentBytes,
+    ReceivedBytes;
+
+// --- STEP 2: Enrich with the process command line to see what script is running ---
+let ProcessContext = DeviceProcessEvents
+| where Timestamp > ago(LookbackWindow)
+| where FileName in~ (ScriptingProcesses)
+// Look for AI-related keywords in the command line
+| where ProcessCommandLine has_any (
+    "openai", "anthropic", "gemini", "langchain", "llamaindex",
+    "transformers", "huggingface", "api_key", "OPENAI_API_KEY",
+    "cohere", "mistral", "ollama", "gpt", "claude", "llm"
+)
+| project
+    ProcessTime = Timestamp,
+    DeviceName,
+    User = AccountName,
+    Process = FileName,
+    // Truncate long command lines but capture the key parts
+    CommandLine = substring(ProcessCommandLine, 0, 300),
+    ParentProcess = InitiatingProcessFileName;
+
+// --- STEP 3: Summarize scripted API usage patterns ---
+let APIUsageSummary = ScriptedAIConnections
+| summarize
+    APICallCount = count(),
+    TotalBytesSent = sum(SentBytes),
+    TotalBytesReceived = sum(ReceivedBytes),
+    UniqueEndpoints = dcount(AI_API),
+    Endpoints = make_set(AI_API, 5),
+    FirstCall = min(Timestamp),
+    LastCall = max(Timestamp)
+    by DeviceName, User, Process
+| extend
+    Upload_MB = round(toreal(TotalBytesSent) / 1048576, 2),
+    Download_MB = round(toreal(TotalBytesReceived) / 1048576, 2),
+    SessionDuration_Min = datetime_diff("minute", LastCall, FirstCall)
+| extend RiskLevel = case(
+    APICallCount > 500 or Upload_MB > 100, "Critical",
+    APICallCount > HighVolumeThreshold or Upload_MB > 10, "High",
+    APICallCount > 10, "Medium",
+    "Low"
+)
+| extend Finding = strcat(
+    Process, " made ", tostring(APICallCount), " AI API calls",
+    " | Uploaded: ", tostring(Upload_MB), "MB",
+    " | Duration: ", tostring(SessionDuration_Min), " min",
+    " | Endpoints: ", tostring(Endpoints)
+);
+
+// --- STEP 4: Join with process command line context ---
+APIUsageSummary
+| join kind=leftouter (
+    ProcessContext
+    | summarize CommandLines = make_set(CommandLine, 3) by DeviceName, User, Process
+) on DeviceName, User, Process
+| project
+    FirstCall,
+    LastCall,
+    SessionDuration_Min,
+    DeviceName,
+    User,
+    Process,
+    APICallCount,
+    Upload_MB,
+    Download_MB,
+    UniqueEndpoints,
+    Endpoints,
+    RiskLevel,
+    CommandLines,
+    Finding
+| order by RiskLevel asc, APICallCount desc
+
+// ============================================================
+// WHY THIS IS THE HIGHEST-RISK DETECTION:
+//
+//   Browser-based AI usage = one person, one session, manual
+//   Scripted AI API usage = potentially thousands of records
+//   processed automatically, at scale, undetected
+//
+//   A Python script with a leaked or personal OpenAI API key
+//   can process an entire database of employee PII in minutes.
+//   This query catches that before DLP ever sees the data.
+//
+// WHAT TO DO WITH HITS:
+//   1. Review CommandLines for sensitive data references
+//   2. Check Upload_MB — over 10MB is always worth investigating
+//   3. Look for OPENAI_API_KEY in env vars = personal key usage
+//   4. Correlate with Detection 03 to see if files were opened
+//      before the scripted session started
+// ============================================================
