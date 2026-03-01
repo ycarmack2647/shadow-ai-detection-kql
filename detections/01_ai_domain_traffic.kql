@@ -1,1 +1,120 @@
+// ============================================================
+// DETECTION 01: AI Domain Traffic from Corporate Devices
+// ============================================================
+// DESCRIPTION:
+//   Detects devices making network connections to known consumer
+//   and enterprise AI service domains. Flags devices, users, and
+//   frequency of access to unsanctioned AI tools.
+//
+// MITRE ATT&CK:
+//   T1567 - Exfiltration Over Web Service
+//   T1071.001 - Application Layer Protocol: Web Protocols
+//
+// DATA SOURCE: Microsoft Defender for Endpoint (MDE)
+//   Table: DeviceNetworkEvents
+//
+// SEVERITY: Medium
+// FREQUENCY: Run every 1 hour
+// ============================================================
 
+// --- CONFIGURATION: Add or remove domains as needed ---
+let ShadowAI_Domains = dynamic([
+    // OpenAI / ChatGPT
+    "chat.openai.com",
+    "api.openai.com",
+    "openai.com",
+    // Google Gemini / Bard
+    "gemini.google.com",
+    "bard.google.com",
+    "aistudio.google.com",
+    // Anthropic Claude
+    "claude.ai",
+    "api.anthropic.com",
+    // Meta AI
+    "meta.ai",
+    // Perplexity
+    "perplexity.ai",
+    // Hugging Face
+    "huggingface.co",
+    // Cohere
+    "cohere.com",
+    "dashboard.cohere.com",
+    // Mistral
+    "mistral.ai",
+    "console.mistral.ai",
+    // Character.AI
+    "character.ai",
+    "beta.character.ai",
+    // Poe (Quora AI)
+    "poe.com",
+    // You.com AI
+    "you.com",
+    // Jasper AI
+    "jasper.ai",
+    // Copy.ai
+    "copy.ai",
+    // Notion AI (if unsanctioned)
+    "notion.so",
+    // Runway ML
+    "runwayml.com",
+    // Replicate
+    "replicate.com"
+]);
+
+// --- SANCTIONED DOMAINS: Remove from results (tools approved by your org) ---
+let Sanctioned_AI_Domains = dynamic([
+    // Example: If Microsoft Copilot is approved, add it here
+    "copilot.microsoft.com",
+    "bing.com"
+]);
+
+// --- MAIN DETECTION QUERY ---
+DeviceNetworkEvents
+| where Timestamp > ago(24h)
+| where ActionType == "ConnectionSuccess"
+// Match against known AI domains
+| where RemoteUrl has_any (ShadowAI_Domains)
+    or RemoteUrl has_any (ShadowAI_Domains)
+// Exclude sanctioned tools
+| where not(RemoteUrl has_any (Sanctioned_AI_Domains))
+// Enrich with device info
+| extend AI_Domain = tostring(split(RemoteUrl, "/")[0])
+| extend IsHTTPS = RemotePort == 443
+// Summarize per device and domain
+| summarize
+    ConnectionCount = count(),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    UniqueURLs = dcount(RemoteUrl),
+    SampleURLs = make_set(RemoteUrl, 5)
+    by DeviceName, DeviceId, InitiatingProcessAccountName, AI_Domain, IsHTTPS
+// Flag high-frequency access (potential data exfiltration vs casual browsing)
+| extend RiskLevel = case(
+    ConnectionCount > 100, "High",
+    ConnectionCount > 25,  "Medium",
+    "Low"
+)
+| extend Finding = strcat("Device accessing Shadow AI tool: ", AI_Domain,
+    " | Connections: ", tostring(ConnectionCount),
+    " | User: ", InitiatingProcessAccountName)
+| project
+    Timestamp = LastSeen,
+    DeviceName,
+    User = InitiatingProcessAccountName,
+    AI_Domain,
+    ConnectionCount,
+    UniqueURLs,
+    RiskLevel,
+    FirstSeen,
+    SampleURLs,
+    Finding
+| order by ConnectionCount desc
+
+// ============================================================
+// TUNING NOTES:
+//   - Increase the ConnectionCount threshold if you get too many
+//     low-value results from occasional browsing
+//   - Add your org's approved AI tools to Sanctioned_AI_Domains
+//   - Scope to specific device groups using DeviceName contains
+//     "WMATA" or similar naming convention
+// ============================================================
