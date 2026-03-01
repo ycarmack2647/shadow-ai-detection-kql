@@ -1,0 +1,164 @@
+// ============================================================
+// DETECTION 04: Shadow AI Application Download or Installation
+// ============================================================
+// DESCRIPTION:
+//   Detects when users download or install standalone AI
+//   applications, desktop clients, or browser extensions
+//   associated with consumer AI tools. This covers the
+//   app-based vector beyond just browser usage.
+//
+// MITRE ATT&CK:
+//   T1072 - Software Deployment Tools
+//   T1204.002 - User Execution: Malicious File
+//   T1176 - Browser Extensions
+//
+// DATA SOURCE: Microsoft Defender for Endpoint (MDE)
+//   Tables: DeviceFileEvents + DeviceProcessEvents
+//
+// SEVERITY: Medium
+// FREQUENCY: Run every 4 hours
+// ============================================================
+
+let LookbackWindow = 24h;
+
+// --- AI APP INSTALLER FILENAME PATTERNS ---
+let AIApp_FilePatterns = dynamic([
+    // ChatGPT desktop
+    "ChatGPT", "chatgpt-",
+    // Claude desktop
+    "Claude", "claude-desktop",
+    // Copilot
+    "CopilotSetup", "copilot-",
+    // Ollama (local LLM runner - common shadow AI)
+    "ollama", "Ollama",
+    // LM Studio (local LLM runner)
+    "LM Studio", "LMStudio",
+    // Jan.ai (local LLM)
+    "jan-", "Jan-",
+    // GPT4All
+    "gpt4all", "GPT4All",
+    // Hugging Face desktop
+    "huggingface",
+    // Perplexity desktop
+    "Perplexity",
+    // Cursor (AI code editor)
+    "Cursor", "cursor-",
+    // GitHub Copilot CLI
+    "gh-copilot",
+    // Codeium
+    "codeium",
+    // Tabnine
+    "tabnine"
+]);
+
+// --- SUSPICIOUS DOWNLOAD PATHS ---
+let SuspiciousDownloadPaths = dynamic([
+    "\\Downloads\\",
+    "\\AppData\\Local\\Temp\\",
+    "\\Users\\Public\\",
+    "%TEMP%"
+]);
+
+// --- STEP 1: Detect AI app file downloads ---
+let AIAppDownloads = DeviceFileEvents
+| where Timestamp > ago(LookbackWindow)
+| where ActionType in ("FileCreated", "FileModified")
+// Match installer file patterns
+| where FileName has_any (AIApp_FilePatterns)
+// Match common installer extensions
+| where FileName endswith ".exe"
+    or FileName endswith ".msi"
+    or FileName endswith ".msix"
+    or FileName endswith ".pkg"
+    or FileName endswith ".dmg"
+    or FileName endswith ".zip"
+    or FileName endswith ".crx"    // Chrome extension
+    or FileName endswith ".xpi"    // Firefox extension
+// Landed in a user download/temp path
+| where FolderPath has_any (SuspiciousDownloadPaths)
+    or FolderPath has "Downloads"
+| project
+    EventTime = Timestamp,
+    EventType = "Download",
+    DeviceName,
+    User = InitiatingProcessAccountName,
+    FileName,
+    FolderPath,
+    FileSize,
+    InitiatingProcessFileName,
+    Detail = strcat("AI app installer downloaded: ", FileName);
+
+// --- STEP 2: Detect AI app processes running ---
+let AIAppProcesses = DeviceProcessEvents
+| where Timestamp > ago(LookbackWindow)
+| where FileName has_any (AIApp_FilePatterns)
+    or ProcessCommandLine has_any (AIApp_FilePatterns)
+// Exclude Microsoft-sanctioned Copilot processes
+| where FileName !startswith "Microsoft.Copilot"
+| project
+    EventTime = Timestamp,
+    EventType = "Execution",
+    DeviceName,
+    User = AccountName,
+    FileName,
+    FolderPath = FolderPath,
+    FileSize = long(0),
+    InitiatingProcessFileName,
+    Detail = strcat("AI app process executed: ", FileName,
+        " | CMD: ", substring(ProcessCommandLine, 0, 150));
+
+// --- STEP 3: Detect local LLM model file downloads (large .gguf files) ---
+// GGUF is the standard format for locally-run LLMs like Ollama, LM Studio
+let LocalLLMModelFiles = DeviceFileEvents
+| where Timestamp > ago(LookbackWindow)
+| where ActionType == "FileCreated"
+| where FileName endswith ".gguf"
+    or FileName endswith ".bin" and FileSize > 500000000  // .bin over 500MB = likely model
+    or FileName endswith ".safetensors"
+    or FileName endswith ".ggml"
+| project
+    EventTime = Timestamp,
+    EventType = "LocalLLM_Model",
+    DeviceName,
+    User = InitiatingProcessAccountName,
+    FileName,
+    FolderPath,
+    FileSize,
+    InitiatingProcessFileName,
+    Detail = strcat("Local LLM model file created: ", FileName,
+        " | Size: ", tostring(round(toreal(FileSize)/1073741824, 2)), "GB");
+
+// --- COMBINE ALL FINDINGS ---
+union AIAppDownloads, AIAppProcesses, LocalLLMModelFiles
+| extend RiskLevel = case(
+    EventType == "LocalLLM_Model", "High",     // Running AI locally = bypasses all cloud controls
+    EventType == "Execution",      "High",     // App is already running
+    EventType == "Download",       "Medium",   // Downloaded but not yet run
+    "Low"
+)
+| extend Finding = strcat("[", RiskLevel, "] ", Detail, " on ", DeviceName, " by ", User)
+| project
+    EventTime,
+    EventType,
+    DeviceName,
+    User,
+    FileName,
+    FolderPath,
+    RiskLevel,
+    InitiatingProcessFileName,
+    Finding
+| order by RiskLevel asc, EventTime desc
+
+// ============================================================
+// KEY INSIGHT — LOCAL LLM RISK:
+//   Local AI models (Ollama, LM Studio, GPT4All) are the HARDEST
+//   shadow AI to detect via network monitoring because they run
+//   entirely on the endpoint — no cloud traffic to flag.
+//   This query catches them at the file system level when the
+//   model weights are downloaded (usually 2GB - 70GB files).
+//
+// WMATA CONTEXT:
+//   An employee running a local LLM on a corporate laptop could
+//   feed in sensitive transit operations data with zero network
+//   exfiltration visible to standard monitoring tools.
+// ============================================================
