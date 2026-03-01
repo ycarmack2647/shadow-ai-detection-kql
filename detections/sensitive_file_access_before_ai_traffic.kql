@@ -1,0 +1,148 @@
+// ============================================================
+// DETECTION 03: Sensitive File Access Followed by AI Tool Usage
+// ============================================================
+// DESCRIPTION:
+//   Correlates file access events (sensitive file types: PII,
+//   credentials, configs, databases) with subsequent network
+//   connections to AI service endpoints within a short window.
+//   This pattern strongly suggests a user opened a sensitive
+//   file and then fed its contents into a consumer AI tool.
+//
+// MITRE ATT&CK:
+//   T1213 - Data from Information Repositories
+//   T1567 - Exfiltration Over Web Service
+//   T1530 - Data from Cloud Storage Object
+//
+// DATA SOURCE: Microsoft Defender for Endpoint (MDE)
+//   Tables: DeviceFileEvents + DeviceNetworkEvents (joined)
+//
+// SEVERITY: High
+// FREQUENCY: Run every 1 hour
+// ============================================================
+
+// --- CONFIGURATION ---
+let CorrelationWindow = 10m;    // File access → AI traffic within 10 minutes = suspicious
+let LookbackWindow = 24h;
+
+// --- SENSITIVE FILE EXTENSIONS ---
+let SensitiveExtensions = dynamic([
+    // Structured data / databases
+    ".csv", ".xlsx", ".xls", ".mdb", ".accdb", ".sqlite", ".sql",
+    // Documents likely containing PII
+    ".pdf", ".docx", ".doc",
+    // Config and credential files
+    ".env", ".config", ".json", ".yaml", ".yml", ".xml", ".ini",
+    // Code files (source code, scripts)
+    ".py", ".ps1", ".sh", ".js", ".ts",
+    // Key and cert files
+    ".pem", ".key", ".pfx", ".p12", ".cer",
+    // Backup files
+    ".bak", ".backup", ".dump"
+]);
+
+// --- SENSITIVE FILE PATH KEYWORDS ---
+let SensitivePaths = dynamic([
+    "confidential", "sensitive", "pii", "private", "secret",
+    "password", "credential", "finance", "hr", "employee",
+    "payroll", "ssn", "social security", "personal",
+    // WMATA-specific
+    "fare", "transit", "operations", "infrastructure", "smartrip"
+]);
+
+// --- AI DOMAINS ---
+let ShadowAI_Domains = dynamic([
+    "chat.openai.com", "api.openai.com", "openai.com",
+    "gemini.google.com", "aistudio.google.com",
+    "claude.ai", "api.anthropic.com",
+    "perplexity.ai", "huggingface.co", "cohere.com",
+    "mistral.ai", "character.ai", "poe.com", "you.com"
+]);
+
+// --- STEP 1: Get sensitive file access events ---
+let SensitiveFileAccess = DeviceFileEvents
+| where Timestamp > ago(LookbackWindow)
+| where ActionType in ("FileRead", "FileAccessed", "FileModified")
+// Match sensitive extensions
+| where FileName has_any (SensitiveExtensions)
+    or FolderPath has_any (SensitivePaths)
+// Exclude system processes
+| where InitiatingProcessFileName !in~ (
+    "svchost.exe", "system", "antimalware service executable",
+    "mssense.exe", "windefend.exe", "searchindexer.exe",
+    "backgroundtaskhost.exe", "taskhostw.exe"
+)
+| project
+    FileAccessTime = Timestamp,
+    DeviceName,
+    DeviceId,
+    User = InitiatingProcessAccountName,
+    FileName,
+    FolderPath,
+    FileAccessProcess = InitiatingProcessFileName;
+
+// --- STEP 2: Get AI service connections ---
+let AIConnections = DeviceNetworkEvents
+| where Timestamp > ago(LookbackWindow)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (ShadowAI_Domains)
+| extend AI_Domain = tostring(parse_url(RemoteUrl).Host)
+| project
+    AIConnectionTime = Timestamp,
+    DeviceName,
+    DeviceId,
+    User = InitiatingProcessAccountName,
+    AI_Domain,
+    RemoteUrl,
+    SentBytes;
+
+// --- STEP 3: Correlate — file access followed by AI connection ---
+SensitiveFileAccess
+| join kind=inner AIConnections on DeviceName, User
+// Only keep events where AI connection happened AFTER file access
+| where AIConnectionTime > FileAccessTime
+// Within the correlation window
+| where AIConnectionTime < FileAccessTime + CorrelationWindow
+// Calculate how quickly they went to the AI tool after accessing the file
+| extend MinutesUntilAIAccess = datetime_diff("minute", AIConnectionTime, FileAccessTime)
+| extend
+    Upload_MB = round(toreal(SentBytes) / 1048576, 2),
+    RiskLevel = case(
+        MinutesUntilAIAccess <= 2 and SentBytes > 100000, "Critical",
+        MinutesUntilAIAccess <= 5, "High",
+        "Medium"
+    )
+| extend Finding = strcat(
+    "User accessed sensitive file '", FileName,
+    "' then connected to ", AI_Domain,
+    " within ", tostring(MinutesUntilAIAccess), " minute(s)",
+    " | Upload: ", tostring(Upload_MB), "MB"
+)
+| project
+    FileAccessTime,
+    AIConnectionTime,
+    MinutesUntilAIAccess,
+    DeviceName,
+    User,
+    FileName,
+    FolderPath,
+    FileAccessProcess,
+    AI_Domain,
+    Upload_MB,
+    RiskLevel,
+    Finding
+| order by RiskLevel asc, MinutesUntilAIAccess asc
+
+// ============================================================
+// WHAT MAKES THIS DETECTION POWERFUL:
+//   Standard DLP catches data AT the destination (e.g., Purview
+//   flagging a label violation). This query catches the INTENT
+//   — the behavior pattern of opening sensitive data then
+//   immediately going to an AI tool, even if the upload itself
+//   isn't flagged by DLP yet.
+//
+// TUNING:
+//   - Tighten CorrelationWindow to 5m for higher precision
+//   - Expand SensitivePaths with your org's folder naming
+//   - Add file size filter (ActionType == "FileRead" and
+//     FileSize > 10000) to reduce noise from tiny files
+// ============================================================
