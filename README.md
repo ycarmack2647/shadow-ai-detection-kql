@@ -152,4 +152,4 @@ Tuning suggestions welcome — especially org-specific path patterns for Detecti
 ---
 
 *Built for Microsoft Sentinel + MDE | March 2026*  
-*Author: Cloud Security Engineer — Transit Sector*
+Yashon Carmack: Cloud Security Engineer — Transit Sector*
