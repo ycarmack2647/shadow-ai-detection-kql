@@ -1,0 +1,114 @@
+// ============================================================
+// DETECTION 02: Large Data Uploads to AI Service Endpoints
+// ============================================================
+// DESCRIPTION:
+//   Detects unusually large outbound data transfers to known AI
+//   service domains. High BytesSent values indicate users may
+//   be uploading sensitive documents, databases, or code to
+//   consumer AI tools — a critical data privacy risk.
+//
+// MITRE ATT&CK:
+//   T1567.002 - Exfiltration to Cloud Storage
+//   T1048 - Exfiltration Over Alternative Protocol
+//
+// DATA SOURCE: Microsoft Defender for Endpoint (MDE)
+//   Table: DeviceNetworkEvents
+//
+// SEVERITY: High
+// FREQUENCY: Run every 30 minutes
+// ============================================================
+
+// --- THRESHOLDS (adjust based on your baseline) ---
+let UploadThreshold_MB = 5;         // Flag uploads over 5MB to AI services
+let UploadThreshold_Bytes = UploadThreshold_MB * 1024 * 1024;
+let LookbackWindow = 1h;            // Detection window
+let SessionWindow = 15m;            // Group connections within 15min as a session
+
+// --- KNOWN AI DOMAINS (same list as Detection 01) ---
+let ShadowAI_Domains = dynamic([
+    "chat.openai.com", "api.openai.com", "openai.com",
+    "gemini.google.com", "aistudio.google.com",
+    "claude.ai", "api.anthropic.com",
+    "perplexity.ai", "huggingface.co",
+    "cohere.com", "mistral.ai", "character.ai",
+    "poe.com", "you.com", "jasper.ai",
+    "copy.ai", "replicate.com", "runwayml.com"
+]);
+
+// --- MAIN DETECTION QUERY ---
+DeviceNetworkEvents
+| where Timestamp > ago(LookbackWindow)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (ShadowAI_Domains)
+// Only look at events with byte count data
+| where isnotnull(SentBytes) and SentBytes > 0
+// Extract the AI domain cleanly
+| extend AI_Domain = tostring(parse_url(RemoteUrl).Host)
+// Group into upload sessions per user/device/domain
+| summarize
+    TotalBytesSent = sum(SentBytes),
+    TotalBytesReceived = sum(ReceivedBytes),
+    ConnectionCount = count(),
+    SessionStart = min(Timestamp),
+    SessionEnd = max(Timestamp),
+    SampleURLs = make_set(RemoteUrl, 3)
+    by DeviceName, InitiatingProcessAccountName,
+       InitiatingProcessFileName, AI_Domain,
+       bin(Timestamp, SessionWindow)
+// Filter to sessions exceeding threshold
+| where TotalBytesSent > UploadThreshold_Bytes
+// Convert to human-readable sizes
+| extend
+    Upload_MB = round(toreal(TotalBytesSent) / 1048576, 2),
+    Download_MB = round(toreal(TotalBytesReceived) / 1048576, 2)
+// Classify risk by upload size
+| extend RiskLevel = case(
+    Upload_MB > 50,  "Critical",
+    Upload_MB > 20,  "High",
+    Upload_MB > 5,   "Medium",
+    "Low"
+)
+// Flag the initiating process (browser vs script vs app)
+| extend ProcessRisk = case(
+    InitiatingProcessFileName in~ ("python.exe", "powershell.exe", "cmd.exe", "curl.exe", "wget.exe"),
+        "CRITICAL - Scripted upload",
+    InitiatingProcessFileName in~ ("chrome.exe", "msedge.exe", "firefox.exe"),
+        "Medium - Browser upload",
+    "Low - Unknown process"
+)
+| extend Finding = strcat(
+    "Large upload to ", AI_Domain,
+    " | Size: ", tostring(Upload_MB), "MB",
+    " | Process: ", InitiatingProcessFileName,
+    " | User: ", InitiatingProcessAccountName
+)
+| project
+    SessionStart,
+    SessionEnd,
+    DeviceName,
+    User = InitiatingProcessAccountName,
+    AI_Domain,
+    Upload_MB,
+    Download_MB,
+    ConnectionCount,
+    InitiatingProcessFileName,
+    RiskLevel,
+    ProcessRisk,
+    SampleURLs,
+    Finding
+| order by Upload_MB desc
+
+// ============================================================
+// WHAT TO LOOK FOR:
+//   - Python.exe or PowerShell uploading to AI APIs = likely
+//     automated data exfiltration via script, highest risk
+//   - Browser uploads over 20MB = user uploading documents/
+//     spreadsheets, possible PII exposure
+//   - Repeated sessions from same user = pattern of behavior
+//     vs one-time accidental upload
+//
+// WMATA CONTEXT:
+//   Transit fare card data, employee PII, infrastructure docs,
+//   and operational schedules should NEVER be uploaded to
+//   consumer AI services. Flag any upload over 5MB immediately.
+// ============================================================
